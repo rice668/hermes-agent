@@ -1,10 +1,13 @@
 /**
- * Log hardening (boundary/log.ts): safeStringify never throws on a circular ref /
- * BigInt / hostile toJSON, so one bad `data` payload can't flip `fileBroken` and
- * kill file logging for the session.
+ * Log hardening (boundary/log.ts):
+ *   - safeStringify never throws on a circular ref / BigInt / hostile toJSON,
+ *     so one bad `data` payload can't flip `fileBroken` and kill file logging.
+ *   - the NDJSON file rotates by size (counter-driven), keeping disk bounded.
+ * Rotation is exercised with a real temp dir; since LOG_MAX_BYTES (5 MiB) is not
+ * exported, we seed the live file above the cap so the next write must rotate.
  */
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -68,6 +71,33 @@ describe('Log file logging survives a poison payload', () => {
       expect(lines.length).toBe(2)
       expect(lines[0]).toContain('[Circular]')
       expect(lines[1]).toContain('42n')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Log file rotation', () => {
+  test('rotates the live file once it crosses the byte cap', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hermes-log-rotate-'))
+    const file = join(dir, 'opentui-v2.log')
+    try {
+      // Seed the live file ABOVE the 5 MiB cap so the very next write rotates.
+      writeFileSync(file, 'x'.repeat(5 * 1024 * 1024 + 10) + '\n')
+      const log = new Log(file, 'debug')
+      log.info('test', 'first write after seed') // crosses the cap -> rotates
+      log.info('test', 'second write on fresh file')
+
+      const names = readdirSync(dir).sort()
+      expect(names).toContain('opentui-v2.log')
+      expect(names).toContain('opentui-v2.log.1') // the seeded oversized file
+      // The fresh live file holds the post-rotation writes, not the seed.
+      const live = readFileLines(file)
+      expect(live.length).toBe(2)
+      expect(live[0]).toContain('first write after seed')
+      // The rotated-out file is the big seed.
+      const rotated = readFileLines(`${file}.1`)
+      expect(rotated[0]?.startsWith('xxxx')).toBe(true)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

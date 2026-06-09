@@ -16,7 +16,7 @@
  * console/stdout/stderr; file + ring only. It's the single approved logging path
  * for the whole engine. Level filter via HERMES_TUI_LOG_LEVEL (default INFO).
  */
-import { appendFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -70,6 +70,15 @@ export interface LogEntry {
 
 const RING_LIMIT = 2000
 
+// Size-based rotation for the append-only NDJSON file (mirrors opencode's
+// keep-N model, but size- rather than time-keyed since we write one growing
+// file). When the live file crosses LOG_MAX_BYTES we shift
+// `.log` → `.log.1` → … → `.log.${LOG_KEEP}` (dropping the oldest) and resume on
+// a fresh empty `.log`. Rotation is best-effort: any failure leaves us writing
+// to the existing file (logging must never crash the engine).
+const LOG_MAX_BYTES = 5 * 1024 * 1024
+const LOG_KEEP = 5
+
 function defaultLogFile(): string {
   const explicit = process.env.HERMES_TUI_LOG_FILE?.trim()
   if (explicit) return explicit
@@ -92,6 +101,11 @@ export class Log {
   private file: string | null
   private fileBroken = false
   private minPriority: number
+  // Bytes in the live log file. Seeded from statSync on open (counter approach —
+  // we avoid a statSync on EVERY write); incremented by each line's byte length
+  // and reset to 0 after a rotation. Rotation triggers when this would cross
+  // LOG_MAX_BYTES, so the live file stays bounded without per-write fs stats.
+  private fileBytes = 0
 
   constructor(file: string | null = defaultLogFile(), level: LogLevel = defaultLevel()) {
     this.file = file
@@ -102,11 +116,44 @@ export class Log {
       } catch {
         this.fileBroken = true
       }
+      try {
+        this.fileBytes = statSync(this.file).size
+      } catch {
+        this.fileBytes = 0 // no existing file (or unreadable) → start the counter at 0
+      }
     }
   }
 
   setLevel(level: LogLevel): void {
     this.minPriority = PRIORITY[level]
+  }
+
+  /**
+   * Best-effort size-based rotation: `.log.${LOG_KEEP}` is dropped, every other
+   * `.log.N` shifts up, the live `.log` becomes `.log.1`, and the counter resets
+   * so writing continues on a fresh file. Any fs failure is swallowed and we keep
+   * writing to the existing file — rotation must never crash logging.
+   */
+  private rotate(file: string): void {
+    try {
+      try {
+        unlinkSync(`${file}.${LOG_KEEP}`)
+      } catch {
+        // oldest slot may not exist yet — fine
+      }
+      for (let i = LOG_KEEP - 1; i >= 1; i--) {
+        try {
+          renameSync(`${file}.${i}`, `${file}.${i + 1}`)
+        } catch {
+          // that slot may not exist yet — fine
+        }
+      }
+      renameSync(file, `${file}.1`)
+      this.fileBytes = 0
+    } catch {
+      // rotation failed (e.g. live file vanished) — leave the counter alone and
+      // keep appending to the existing path; better an oversized log than none.
+    }
   }
 
   private write(level: LogLevel, scope: string, msg: string, data?: unknown): void {
@@ -118,7 +165,10 @@ export class Log {
 
     if (this.file && !this.fileBroken) {
       try {
-        appendFileSync(this.file, safeStringify(entry) + '\n')
+        const line = safeStringify(entry) + '\n'
+        if (this.fileBytes > 0 && this.fileBytes + Buffer.byteLength(line) > LOG_MAX_BYTES) this.rotate(this.file)
+        appendFileSync(this.file, line)
+        this.fileBytes += Buffer.byteLength(line)
       } catch {
         this.fileBroken = true // stop hammering a broken path; the ring keeps working
       }
