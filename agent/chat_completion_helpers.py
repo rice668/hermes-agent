@@ -1107,6 +1107,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    # Hybrid local attempts handle their own cloud escalation, so the native
+    # failover must stay out of the way. Compare against ``True`` explicitly:
+    # the flag is always a real bool, and ``is True`` keeps MagicMock-based
+    # test agents (whose auto-created attrs are truthy) from tripping this.
+    if getattr(agent, "_hybrid_local_attempt", False) is True:
+        return False
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the

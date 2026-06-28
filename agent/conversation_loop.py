@@ -468,6 +468,336 @@ def _content_policy_blocked_result(
     }
 
 
+def build_iteration_request(
+    agent,
+    messages,
+    *,
+    active_system_prompt,
+    current_turn_user_idx,
+    ext_prefetch_cache,
+    plugin_user_context,
+    moa_config=None,
+    original_user_message=None,
+):
+    """Build per-iteration API messages and rough token estimates."""
+
+    api_messages = []
+    for idx, msg in enumerate(messages):
+        api_msg = msg.copy()
+
+        # Inject ephemeral context into the current turn's user message.
+        # Sources: memory manager prefetch + plugin pre_llm_call hooks
+        # with target="user_message" (the default).  Both are
+        # API-call-time only — the original message in `messages` is
+        # never mutated, so nothing leaks into session persistence.
+        if idx == current_turn_user_idx and msg.get("role") == "user":
+            _injections = []
+            if ext_prefetch_cache:
+                _fenced = build_memory_context_block(ext_prefetch_cache)
+                if _fenced:
+                    _injections.append(_fenced)
+            if plugin_user_context:
+                _injections.append(plugin_user_context)
+            if _injections:
+                _base = api_msg.get("content", "")
+                if isinstance(_base, str):
+                    api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+
+        # For ALL assistant messages, pass reasoning back to the API
+        # This ensures multi-turn reasoning context is preserved
+        agent._copy_reasoning_content_for_api(msg, api_msg)
+
+        # Remove 'reasoning' field - it's for trajectory storage only
+        # We've copied it to 'reasoning_content' for the API above
+        if "reasoning" in api_msg:
+            api_msg.pop("reasoning")
+        # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
+        if "finish_reason" in api_msg:
+            api_msg.pop("finish_reason")
+        # Strip internal thinking-prefill marker
+        api_msg.pop("_thinking_prefill", None)
+        # Strip Codex Responses API fields (call_id, response_item_id) for
+        # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
+        # Uses new dicts so the internal messages list retains the fields
+        # for Codex Responses compatibility.
+        if agent._should_sanitize_tool_calls():
+            agent._sanitize_tool_calls_for_strict_api(api_msg, model=agent.model)
+        # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
+        # The signature field helps maintain reasoning continuity
+        api_messages.append(api_msg)
+
+    # Build the final system message: cached prompt + ephemeral system prompt.
+    # Ephemeral additions are API-call-time only (not persisted to session DB).
+    # External recall context is injected into the user message, not the system
+    # prompt, so the stable cache prefix remains unchanged.
+    #
+    # NOTE: Plugin context from pre_llm_call hooks is injected into the
+    # user message (see injection block above), NOT the system prompt.
+    # This is intentional — system prompt modifications break the prompt
+    # cache prefix.  The system prompt is reserved for Hermes internals.
+    #
+    # Hermes invariant: the system prompt is built ONCE per session
+    # (cached on ``_cached_system_prompt``) and replayed verbatim on
+    # every turn.  We send it as a single content string so the
+    # bytes are byte-stable across turns and upstream prompt caches
+    # stay warm.
+    effective_system = _hybrid_active_system_prompt(agent, active_system_prompt) or ""
+    if agent.ephemeral_system_prompt:
+        effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+    if effective_system:
+        api_messages = [{"role": "system", "content": effective_system}] + api_messages
+
+    if moa_config:
+        try:
+            from agent.moa_loop import aggregate_moa_context
+
+            _moa_context = aggregate_moa_context(
+                user_prompt=original_user_message if isinstance(original_user_message, str) else str(original_user_message),
+                api_messages=api_messages,
+                reference_models=moa_config.get("reference_models") or [],
+                aggregator=moa_config.get("aggregator") or {},
+                temperature=float(moa_config.get("reference_temperature", 0.6) or 0.6),
+                aggregator_temperature=float(moa_config.get("aggregator_temperature", 0.4) or 0.4),
+            )
+            if _moa_context:
+                for _msg in reversed(api_messages):
+                    if _msg.get("role") == "user":
+                        _base = _msg.get("content", "")
+                        if isinstance(_base, str):
+                            _msg["content"] = _base + "\n\n" + _moa_context
+                        break
+        except Exception as _moa_exc:
+            logger.warning("MoA context aggregation failed: %s", _moa_exc)
+
+    # Inject ephemeral prefill messages right after the system prompt
+    # but before conversation history. Same API-call-time-only pattern.
+    if agent.prefill_messages:
+        sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
+        for idx, pfm in enumerate(agent.prefill_messages):
+            api_messages.insert(sys_offset + idx, pfm.copy())
+
+    # Apply Anthropic prompt caching for Claude models on native
+    # Anthropic, OpenRouter, and third-party Anthropic-compatible
+    # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
+    # inject cache_control breakpoints (system + last 3 messages)
+    # to reduce input token costs by ~75% on multi-turn
+    # conversations.
+    if agent._use_prompt_caching:
+        api_messages = apply_anthropic_cache_control(
+            api_messages,
+            cache_ttl=agent._cache_ttl,
+            native_anthropic=agent._use_native_cache_layout,
+        )
+
+    # Safety net: strip orphaned tool results / add stubs for missing
+    # results before sending to the API.  Runs unconditionally — not
+    # gated on context_compressor — so orphans from session loading or
+    # manual message manipulation are always caught.
+    api_messages = agent._sanitize_api_messages(api_messages)
+
+    # Drop thinking-only assistant turns (reasoning but no visible
+    # output and no tool_calls) and merge any adjacent user messages
+    # left behind. Prevents Anthropic 400s ("The final block in an
+    # assistant message cannot be `thinking`.") and equivalent errors
+    # from third-party Anthropic-compatible gateways that can't replay
+    # a thinking-only turn. Runs on the per-call copy only — the
+    # stored conversation history keeps the reasoning block for the
+    # UI transcript and session persistence.
+    api_messages = agent._drop_thinking_only_and_merge_users(
+        api_messages,
+        drop_codex_reasoning_items=agent.api_mode != "codex_responses",
+    )
+
+    # Normalize message whitespace and tool-call JSON for consistent
+    # prefix matching.  Ensures bit-perfect prefixes across turns,
+    # which enables KV cache reuse on local inference servers
+    # (llama.cpp, vLLM, Ollama) and improves cache hit rates for
+    # cloud providers.  Operates on api_messages (the API copy) so
+    # the original conversation history in `messages` is untouched.
+    for am in api_messages:
+        if isinstance(am.get("content"), str):
+            am["content"] = am["content"].strip()
+    for am in api_messages:
+        tcs = am.get("tool_calls")
+        if not tcs:
+            continue
+        new_tcs = []
+        for tc in tcs:
+            if isinstance(tc, dict) and "function" in tc:
+                try:
+                    args_obj = json.loads(tc["function"]["arguments"])
+                    tc = {
+                        **tc,
+                        "function": {
+                            **tc["function"],
+                            "arguments": json.dumps(
+                                args_obj,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                        },
+                    }
+                except Exception:
+                    tc["function"]["arguments"] = _repair_tool_call_arguments(
+                        tc["function"]["arguments"],
+                        tc["function"].get("name", "?"),
+                    )
+            new_tcs.append(tc)
+        am["tool_calls"] = new_tcs
+
+    # Proactively strip any surrogate characters before the API call.
+    # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
+    # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
+    # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
+    _sanitize_messages_surrogates(api_messages)
+
+    total_chars = sum(len(str(msg)) for msg in api_messages)
+    approx_tokens = estimate_messages_tokens_rough(api_messages)
+    approx_request_tokens = estimate_request_tokens_rough(
+        api_messages,
+        tools=agent.tools or None,
+    )
+    return api_messages, approx_tokens, approx_request_tokens, total_chars
+
+
+def _hybrid_escalate(agent, reason, *, ephemeral_snap, duration_ms=None):
+    """Mark this iteration to redo on cloud while preserving real reason."""
+
+    agent._ephemeral_max_output_tokens = ephemeral_snap
+    agent._hybrid_redo_on_cloud = True
+    agent._hybrid_pending_reason = reason
+    hybrid_router = getattr(agent, "hybrid_router", None)
+    if (
+        hybrid_router is not None
+        and hybrid_router.health is not None
+        and reason in {"local_api_error", "local_timeout", "endpoint_down"}
+    ):
+        hybrid_router.health.mark_failure()
+
+    attempts = getattr(agent, "_hybrid_attempts", None)
+    if attempts is None:
+        attempts = agent._hybrid_attempts = []
+    attempts.append(
+        {
+            "backend": "local",
+            "reason": reason,
+            "accepted": False,
+            "duration_ms": duration_ms,
+        }
+    )
+    try:
+        agent.iteration_budget.refund()
+    except Exception:
+        pass
+
+
+def _hybrid_last_tool_failed(messages):
+    """True if the most recent tool message looks like a failure."""
+
+    from agent.tool_guardrails import classify_tool_failure
+
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "tool":
+            failed, _ = classify_tool_failure(
+                message.get("name", ""),
+                message.get("content"),
+            )
+            return bool(failed)
+        if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
+            break
+    return False
+
+
+def _hybrid_record_accepted_attempt(agent, api_duration):
+    """Record a hybrid attempt accepted by the loop for handling."""
+
+    if getattr(agent, "hybrid_router", None) is None:
+        return
+    backend = getattr(agent, "_hybrid_attempt_backend", "cloud")
+    reason = (
+        getattr(agent, "_hybrid_pending_reason", None)
+        if backend == "cloud"
+        else "accept"
+    )
+    attempts = getattr(agent, "_hybrid_attempts", None)
+    if attempts is None:
+        attempts = agent._hybrid_attempts = []
+    attempts.append(
+        {
+            "backend": backend,
+            "reason": reason,
+            "accepted": True,
+            "duration_ms": int(api_duration * 1000),
+        }
+    )
+    if backend == "local":
+        agent._hybrid_local_calls = getattr(agent, "_hybrid_local_calls", 0) + 1
+    else:
+        agent._hybrid_cloud_calls = getattr(agent, "_hybrid_cloud_calls", 0) + 1
+    agent._hybrid_pending_reason = None
+
+
+def _hybrid_api_request_id(agent, turn_id, api_call_count):
+    suffix = ""
+    if getattr(agent, "hybrid_router", None) is not None:
+        suffix = f":attempt:{getattr(agent, '_hybrid_attempt_backend', 'cloud')}"
+    return f"{turn_id}:api:{api_call_count}{suffix}"
+
+
+def _hybrid_prepare_cloud_for_internal_work(agent, hybrid_router):
+    if hybrid_router is None or not getattr(agent, "_hybrid_local_attempt", False):
+        return
+    from agent.hybrid_router import apply_runtime_profile
+
+    apply_runtime_profile(agent, hybrid_router.cloud)
+    agent._hybrid_attempt_backend = "cloud"
+    agent._hybrid_local_attempt = False
+
+
+def _hybrid_active_system_prompt(agent, active_system_prompt):
+    if getattr(agent, "hybrid_router", None) is None:
+        return active_system_prompt
+    if not isinstance(active_system_prompt, str) or not active_system_prompt:
+        return active_system_prompt
+
+    model = getattr(agent, "model", "") or ""
+    provider = getattr(agent, "provider", "") or ""
+    if not model and not provider:
+        return active_system_prompt
+
+    lines = active_system_prompt.split("\n")
+    timestamp_idx = None
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].startswith("Conversation started:"):
+            timestamp_idx = idx
+            break
+    if timestamp_idx is None:
+        return active_system_prompt
+
+    found_model = False
+    found_provider = False
+    rewritten = []
+    for idx, line in enumerate(lines):
+        if idx > timestamp_idx and line.startswith("Model:"):
+            found_model = True
+            if model:
+                rewritten.append(f"Model: {model}")
+            continue
+        if idx > timestamp_idx and line.startswith("Provider:"):
+            found_provider = True
+            if provider:
+                rewritten.append(f"Provider: {provider}")
+            continue
+        rewritten.append(line)
+
+    if model and not found_model:
+        rewritten.append(f"Model: {model}")
+    if provider and not found_provider:
+        rewritten.append(f"Provider: {provider}")
+
+    return "\n".join(rewritten)
+
+
 def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     """Refresh the in-flight system message after a provider failover.
 
@@ -613,6 +943,29 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
+
+        _hybrid = getattr(agent, "hybrid_router", None)
+        if _hybrid is not None:
+            _hybrid_ephemeral_snap = getattr(agent, "_ephemeral_max_output_tokens", None)
+            _force_cloud = getattr(agent, "_hybrid_redo_on_cloud", False)
+            agent._hybrid_redo_on_cloud = False
+            from agent.hybrid_router import Reason, apply_runtime_profile
+
+            _pre = _hybrid.decide_pre(
+                tools=agent.tools,
+                api_messages=messages,
+                fingerprint=_hybrid.fingerprint,
+                is_first_step=(api_call_count == 0),
+                force_cloud=_force_cloud,
+            )
+            apply_runtime_profile(
+                agent,
+                _hybrid.local if _pre.backend == "local" else _hybrid.cloud,
+            )
+            agent._hybrid_attempt_backend = _pre.backend
+            agent._hybrid_local_attempt = _pre.backend == "local"
+            if _pre.backend == "cloud" and _pre.reason != Reason.REDO_CLOUD:
+                agent._hybrid_pending_reason = _pre.reason
         
         api_call_count += 1
         agent._api_call_count = api_call_count
@@ -751,178 +1104,36 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
-        api_messages = []
-        for idx, msg in enumerate(messages):
-            api_msg = msg.copy()
-
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated, so nothing leaks into session persistence.
-            if idx == current_turn_user_idx and msg.get("role") == "user":
-                _injections = []
-                if _ext_prefetch_cache:
-                    _fenced = build_memory_context_block(_ext_prefetch_cache)
-                    if _fenced:
-                        _injections.append(_fenced)
-                if _plugin_user_context:
-                    _injections.append(_plugin_user_context)
-                if _injections:
-                    _base = api_msg.get("content", "")
-                    if isinstance(_base, str):
-                        api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
-
-            # For ALL assistant messages, pass reasoning back to the API
-            # This ensures multi-turn reasoning context is preserved
-            agent._copy_reasoning_content_for_api(msg, api_msg)
-
-            # Remove 'reasoning' field - it's for trajectory storage only
-            # We've copied it to 'reasoning_content' for the API above
-            if "reasoning" in api_msg:
-                api_msg.pop("reasoning")
-            # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
-            if "finish_reason" in api_msg:
-                api_msg.pop("finish_reason")
-            # Strip internal thinking-prefill marker
-            api_msg.pop("_thinking_prefill", None)
-            # Strip Codex Responses API fields (call_id, response_item_id) for
-            # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
-            # Uses new dicts so the internal messages list retains the fields
-            # for Codex Responses compatibility.
-            if agent._should_sanitize_tool_calls():
-                agent._sanitize_tool_calls_for_strict_api(api_msg, model=agent.model)
-            # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
-            # The signature field helps maintain reasoning continuity
-            api_messages.append(api_msg)
-
-        # Build the final system message: cached prompt + ephemeral system prompt.
-        # Ephemeral additions are API-call-time only (not persisted to session DB).
-        # External recall context is injected into the user message, not the system
-        # prompt, so the stable cache prefix remains unchanged.
-        #
-        # NOTE: Plugin context from pre_llm_call hooks is injected into the
-        # user message (see injection block above), NOT the system prompt.
-        # This is intentional — system prompt modifications break the prompt
-        # cache prefix.  The system prompt is reserved for Hermes internals.
-        #
-        # Hermes invariant: the system prompt is built ONCE per session
-        # (cached on ``_cached_system_prompt``) and replayed verbatim on
-        # every turn.  We send it as a single content string so the
-        # bytes are byte-stable across turns and upstream prompt caches
-        # stay warm.
-        effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
-        if effective_system:
-            api_messages = [{"role": "system", "content": effective_system}] + api_messages
-
-        if moa_config:
-            try:
-                from agent.moa_loop import aggregate_moa_context
-
-                _moa_context = aggregate_moa_context(
-                    user_prompt=original_user_message if isinstance(original_user_message, str) else str(original_user_message),
-                    api_messages=api_messages,
-                    reference_models=moa_config.get("reference_models") or [],
-                    aggregator=moa_config.get("aggregator") or {},
-                    temperature=float(moa_config.get("reference_temperature", 0.6) or 0.6),
-                    aggregator_temperature=float(moa_config.get("aggregator_temperature", 0.4) or 0.4),
-                )
-                if _moa_context:
-                    for _msg in reversed(api_messages):
-                        if _msg.get("role") == "user":
-                            _base = _msg.get("content", "")
-                            if isinstance(_base, str):
-                                _msg["content"] = _base + "\n\n" + _moa_context
-                            break
-            except Exception as _moa_exc:
-                logger.warning("MoA context aggregation failed: %s", _moa_exc)
-
-        # Inject ephemeral prefill messages right after the system prompt
-        # but before conversation history. Same API-call-time-only pattern.
-        if agent.prefill_messages:
-            sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
-            for idx, pfm in enumerate(agent.prefill_messages):
-                api_messages.insert(sys_offset + idx, pfm.copy())
-
-        # Apply Anthropic prompt caching for Claude models on native
-        # Anthropic, OpenRouter, and third-party Anthropic-compatible
-        # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
-        # inject cache_control breakpoints (system + last 3 messages)
-        # to reduce input token costs by ~75% on multi-turn
-        # conversations.
-        if agent._use_prompt_caching:
-            api_messages = apply_anthropic_cache_control(
-                api_messages,
-                cache_ttl=agent._cache_ttl,
-                native_anthropic=agent._use_native_cache_layout,
+        api_messages, approx_tokens, approx_request_tokens, total_chars = (
+            build_iteration_request(
+                agent,
+                messages,
+                active_system_prompt=active_system_prompt,
+                current_turn_user_idx=current_turn_user_idx,
+                ext_prefetch_cache=_ext_prefetch_cache,
+                plugin_user_context=_plugin_user_context,
+                moa_config=moa_config,
+                original_user_message=original_user_message,
             )
-
-        # Safety net: strip orphaned tool results / add stubs for missing
-        # results before sending to the API.  Runs unconditionally — not
-        # gated on context_compressor — so orphans from session loading or
-        # manual message manipulation are always caught.
-        api_messages = agent._sanitize_api_messages(api_messages)
-
-        # Drop thinking-only assistant turns (reasoning but no visible
-        # output and no tool_calls) and merge any adjacent user messages
-        # left behind. Prevents Anthropic 400s ("The final block in an
-        # assistant message cannot be `thinking`.") and equivalent errors
-        # from third-party Anthropic-compatible gateways that can't replay
-        # a thinking-only turn. Runs on the per-call copy only — the
-        # stored conversation history keeps the reasoning block for the
-        # UI transcript and session persistence.
-        api_messages = agent._drop_thinking_only_and_merge_users(
-            api_messages,
-            drop_codex_reasoning_items=agent.api_mode != "codex_responses",
         )
 
-        # Normalize message whitespace and tool-call JSON for consistent
-        # prefix matching.  Ensures bit-perfect prefixes across turns,
-        # which enables KV cache reuse on local inference servers
-        # (llama.cpp, vLLM, Ollama) and improves cache hit rates for
-        # cloud providers.  Operates on api_messages (the API copy) so
-        # the original conversation history in `messages` is untouched.
-        for am in api_messages:
-            if isinstance(am.get("content"), str):
-                am["content"] = am["content"].strip()
-        for am in api_messages:
-            tcs = am.get("tool_calls")
-            if not tcs:
+        if _hybrid is not None and getattr(agent, "_hybrid_local_attempt", False):
+            from agent.hybrid_router import context_overflow
+
+            if context_overflow(
+                approx_request_tokens,
+                agent.max_tokens or 4096,
+                _hybrid.fingerprint.context,
+            ):
+                _reason = (
+                    "unknown_context"
+                    if not _hybrid.fingerprint.context
+                    else "context_overflow"
+                )
+                _hybrid_escalate(agent, _reason, ephemeral_snap=_hybrid_ephemeral_snap)
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
                 continue
-            new_tcs = []
-            for tc in tcs:
-                if isinstance(tc, dict) and "function" in tc:
-                    try:
-                        args_obj = json.loads(tc["function"]["arguments"])
-                        tc = {**tc, "function": {
-                            **tc["function"],
-                            "arguments": json.dumps(
-                                args_obj, separators=(",", ":"),
-                                sort_keys=True,
-                            ),
-                        }}
-                    except Exception:
-                        tc["function"]["arguments"] = _repair_tool_call_arguments(
-                            tc["function"]["arguments"],
-                            tc["function"].get("name", "?"),
-                        )
-                new_tcs.append(tc)
-            am["tool_calls"] = new_tcs
-
-        # Proactively strip any surrogate characters before the API call.
-        # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
-        # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
-        # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
-        _sanitize_messages_surrogates(api_messages)
-
-        # Calculate approximate request size for logging
-        total_chars = sum(len(str(msg)) for msg in api_messages)
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
-        approx_request_tokens = estimate_request_tokens_rough(
-            api_messages, tools=agent.tools or None
-        )
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, approx_request_tokens
@@ -978,7 +1189,7 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
-        api_request_id = f"{turn_id}:api:{api_call_count}"
+        api_request_id = _hybrid_api_request_id(agent, turn_id, api_call_count)
         agent._current_api_request_id = api_request_id
 
         while retry_count < max_retries:
@@ -1200,6 +1411,13 @@ def run_conversation(
                 )
                 
                 api_duration = time.time() - api_start_time
+
+                if (
+                    _hybrid is not None
+                    and getattr(agent, "_hybrid_local_attempt", False)
+                    and _hybrid.health is not None
+                ):
+                    _hybrid.health.mark_ok()
                 
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
@@ -1542,6 +1760,15 @@ def run_conversation(
                         thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
+
+                    if _hybrid is not None and getattr(agent, "_hybrid_local_attempt", False):
+                        _hybrid_escalate(
+                            agent,
+                            "empty_or_refusal",
+                            ephemeral_snap=_hybrid_ephemeral_snap,
+                        )
+                        _retry.restart_with_hybrid_cloud = True
+                        break
 
                     # Deterministic for the unchanged prompt — never retry.
                     # Try a configured fallback once (a different model may not
@@ -2825,6 +3052,7 @@ def run_conversation(
                     compression_attempts += 1
                     if compression_attempts <= max_compression_attempts:
                         original_len = len(messages)
+                        _hybrid_prepare_cloud_for_internal_work(agent, _hybrid)
                         messages, active_system_prompt = agent._compress_context(
                             messages, system_message,
                             approx_tokens=approx_tokens,
@@ -3036,6 +3264,7 @@ def run_conversation(
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                     original_len = len(messages)
+                    _hybrid_prepare_cloud_for_internal_work(agent, _hybrid)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
@@ -3202,6 +3431,7 @@ def run_conversation(
                     agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
                     original_len = len(messages)
+                    _hybrid_prepare_cloud_for_internal_work(agent, _hybrid)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
@@ -3755,6 +3985,11 @@ def run_conversation(
             agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
             continue
 
+        if _hybrid is not None and getattr(_retry, "restart_with_hybrid_cloud", False):
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            continue
+
         # Guard: if all retries exhausted without a successful response
         # (e.g. repeated context-length errors that exhausted retry_count),
         # the `response` variable is still None. Break out cleanly.
@@ -3979,6 +4214,16 @@ def run_conversation(
                     if tc.function.name not in agent.valid_tool_names
                 ]
                 if invalid_tool_calls:
+                    if _hybrid is not None and getattr(agent, "_hybrid_local_attempt", False):
+                        _hybrid_escalate(
+                            agent,
+                            "parse_fail",
+                            ephemeral_snap=_hybrid_ephemeral_snap,
+                        )
+                        api_call_count -= 1
+                        agent._api_call_count = api_call_count
+                        continue
+
                     # Track retries for invalid tool calls
                     agent._invalid_tool_retries += 1
 
@@ -4062,6 +4307,16 @@ def run_conversation(
                         invalid_json_args.append((tc.function.name, str(e)))
                 
                 if invalid_json_args:
+                    if _hybrid is not None and getattr(agent, "_hybrid_local_attempt", False):
+                        _hybrid_escalate(
+                            agent,
+                            "parse_fail",
+                            ephemeral_snap=_hybrid_ephemeral_snap,
+                        )
+                        api_call_count -= 1
+                        agent._api_call_count = api_call_count
+                        continue
+
                     # Check if the invalid JSON is due to truncation rather
                     # than a model formatting mistake.  Routers sometimes
                     # rewrite finish_reason from "length" to "tool_calls",
@@ -4142,6 +4397,23 @@ def run_conversation(
                     assistant_message.tool_calls
                 )
 
+                if _hybrid is not None and getattr(agent, "_hybrid_local_attempt", False):
+                    post_decision = _hybrid.decide_post(
+                        assistant_message=assistant_message,
+                        user_text=original_user_message,
+                        tools=agent.tools,
+                        last_tool_failed=False,
+                    )
+                    if post_decision.backend == "cloud":
+                        _hybrid_escalate(
+                            agent,
+                            post_decision.reason,
+                            ephemeral_snap=_hybrid_ephemeral_snap,
+                        )
+                        api_call_count -= 1
+                        agent._api_call_count = api_call_count
+                        continue
+
                 assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
                 
                 # If this turn has both content AND tool_calls, capture the content
@@ -4197,6 +4469,7 @@ def run_conversation(
                 # a LATER tool round.
                 agent._post_tool_empty_retried = False
 
+                _hybrid_tool_message_start = len(messages)
                 messages.append(assistant_msg)
                 agent._emit_interim_assistant_message(assistant_msg)
                 try:
@@ -4229,6 +4502,18 @@ def run_conversation(
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
+                    if _hybrid is not None and getattr(agent, "_hybrid_local_attempt", False):
+                        del messages[_hybrid_tool_message_start:]
+                        agent._tool_guardrail_halt_decision = None
+                        _hybrid_escalate(
+                            agent,
+                            "no_progress",
+                            ephemeral_snap=_hybrid_ephemeral_snap,
+                        )
+                        api_call_count -= 1
+                        agent._api_call_count = api_call_count
+                        continue
+
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
                     agent._emit_status(
@@ -4249,6 +4534,8 @@ def run_conversation(
                             except Exception:
                                 pass
                     break
+
+                _hybrid_record_accepted_attempt(agent, api_duration)
 
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
@@ -4308,6 +4595,7 @@ def run_conversation(
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
+                    _hybrid_prepare_cloud_for_internal_work(agent, _hybrid)
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
@@ -4503,6 +4791,16 @@ def run_conversation(
                         _has_structured
                         and agent._thinking_prefill_retries >= 2
                     )
+                    if _truly_empty and _hybrid is not None and getattr(agent, "_hybrid_local_attempt", False):
+                        _hybrid_escalate(
+                            agent,
+                            "empty_or_refusal",
+                            ephemeral_snap=_hybrid_ephemeral_snap,
+                        )
+                        api_call_count -= 1
+                        agent._api_call_count = api_call_count
+                        continue
+
                     if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
                         agent._empty_content_retries += 1
                         logger.warning(
@@ -4636,6 +4934,25 @@ def run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+
+                if _hybrid is not None and getattr(agent, "_hybrid_local_attempt", False):
+                    post_decision = _hybrid.decide_post(
+                        assistant_message=assistant_message,
+                        user_text=original_user_message,
+                        tools=agent.tools,
+                        last_tool_failed=_hybrid_last_tool_failed(messages),
+                    )
+                    if post_decision.backend == "cloud":
+                        _hybrid_escalate(
+                            agent,
+                            post_decision.reason,
+                            ephemeral_snap=_hybrid_ephemeral_snap,
+                        )
+                        api_call_count -= 1
+                        agent._api_call_count = api_call_count
+                        continue
+
+                _hybrid_record_accepted_attempt(agent, api_duration)
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 

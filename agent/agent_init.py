@@ -1871,6 +1871,14 @@ def init_agent(
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
 
+    try:
+        from agent.hybrid_router import maybe_build_hybrid_router
+
+        agent.hybrid_router = maybe_build_hybrid_router(agent, os.environ)
+    except Exception as _hybrid_exc:
+        logging.getLogger(__name__).warning("hybrid_router init skipped: %s", _hybrid_exc)
+        agent.hybrid_router = None
+
 
 
 __all__ = ["init_agent"]
