@@ -27,6 +27,15 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
+def attach_hybrid_stats(result, agent):
+    if getattr(agent, "hybrid_router", None) is None:
+        return
+    result.setdefault("hybrid", {})
+    result["hybrid"]["local_calls"] = getattr(agent, "_hybrid_local_calls", 0)
+    result["hybrid"]["cloud_calls"] = getattr(agent, "_hybrid_cloud_calls", 0)
+    result["hybrid"]["attempts"] = getattr(agent, "_hybrid_attempts", [])
+
+
 def finalize_turn(
     agent,
     *,
@@ -400,6 +409,7 @@ def finalize_turn(
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
     }
+    attach_hybrid_stats(result, agent)
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a

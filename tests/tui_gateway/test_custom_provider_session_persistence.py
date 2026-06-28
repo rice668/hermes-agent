@@ -163,6 +163,33 @@ class TestResumeRoundTrip:
         assert kwargs["base_url"] == MIMO_URL
         assert kwargs["api_key"] == MIMO_KEY
 
+    def test_billing_provider_does_not_become_resume_provider(self):
+        """billing_provider is a cost bucket, not a routable provider.
+
+        Mint hybrid sessions can store billing_provider="mint-local" while
+        model_config has no explicit provider. Resuming those rows must fall
+        back to the configured runtime provider instead of passing bare
+        "mint-local" to model-switch resolution.
+        """
+        from tui_gateway.server import _stored_session_runtime_overrides
+
+        row = {
+            "model": "deepseek/deepseek-v4-pro",
+            "billing_provider": "mint-local",
+            "model_config": json.dumps(
+                {
+                    "max_iterations": 90,
+                    "reasoning_config": None,
+                    "max_tokens": None,
+                }
+            ),
+        }
+
+        overrides = _stored_session_runtime_overrides(row)
+
+        assert "provider_override" not in overrides
+        assert overrides["model_override"]["provider"] is None
+
     def test_legacy_row_with_bare_custom_heals_via_base_url(self, monkeypatch):
         """Rows persisted BEFORE the fix stored provider="custom"; the
         rebuild must recover the entry identity from the stored base_url."""

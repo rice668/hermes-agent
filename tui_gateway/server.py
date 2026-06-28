@@ -1966,11 +1966,6 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
     return model, None
 
 
-# Bare billing buckets are not routable provider identities (kept in parity with the
-# provider gate in agent_init). Restoring one as a session provider override breaks resume.
-_BARE_BILLING_PROVIDERS = {"auto", "openrouter", "custom"}
-
-
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
     """Return runtime fields persisted with a stored session.
 
@@ -1997,18 +1992,13 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
 
     overrides: dict = {}
     model = str(row.get("model") or model_config.get("model") or "").strip()
-    # ``billing_provider`` is only the billing bucket — for a custom endpoint it is the
-    # bare class ``"custom"``, which agent_init treats as non-routable, so restoring it as
-    # the provider override makes ``session.resume`` fail with "No LLM provider configured".
-    # Only restore an explicit provider; otherwise leave it unset so resume falls back to
-    # the configured default, matching the working CLI path.
+    # ``billing_provider`` is only the billing bucket, not a routable provider
+    # identity. Mint hybrid rows can persist values like ``mint-local`` here
+    # while the current config only has a cloud provider; restoring that field
+    # as a provider override makes ``session.resume`` fail with "Unknown
+    # provider". Only restore an explicit runtime provider from model_config.
     explicit_provider = str(model_config.get("provider") or "").strip()
-    billing_provider = str(
-        model_config.get("billing_provider") or row.get("billing_provider") or ""
-    ).strip()
     provider = explicit_provider
-    if not provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
-        provider = billing_provider
     base_url = str(model_config.get("base_url") or "").strip()
     api_mode = str(model_config.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
